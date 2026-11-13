@@ -1,0 +1,47 @@
+#Скопировать и вставить в PS
+$T = "$PWD\test_tmp"; if (Test-Path $T) { Remove-Item $T -Recurse -Force }; New-Item -ItemType Directory $T | Out-Null
+New-Item -ItemType Directory "$T\src\sub\deep" | Out-Null
+Set-Content "$T\src\a.txt" "hello"
+$b = New-Object byte[] 300000; (New-Object Random 1).NextBytes($b); [IO.File]::WriteAllBytes("$T\src\big.bin", $b)
+[IO.File]::WriteAllText("$T\src\Длинное имя файла.txt", "привет`n", (New-Object Text.UTF8Encoding $false))
+Set-Content "$T\src\sub\MixedCase.Txt" "x"
+Set-Content "$T\src\sub\deep\z.c" "y"
+New-Item -ItemType File "$T\src\empty.dat" | Out-Null
+$b = New-Object byte[] 1000000; (New-Object Random 2).NextBytes($b); [IO.File]::WriteAllBytes("$T\huge.bin", $b)
+Set-Content "$T\r.txt" "replaced"
+
+$formats = @(
+    @("floppy.img", @("-t", "floppy", "-L", "FLOPPY")),
+    @("fat16.img", @("-f", "fat16", "-s", "32M")),
+    @("fat32.vhd", @("-f", "fat32", "-s", "100M", "--vhd")),
+    @("fat32dyn.vhd", @("-f", "fat32", "-s", "300M", "--vhd-dynamic")),
+    @("ntfs.img", @("-f", "ntfs", "-s", "64M", "--no-mbr", "-L", "DATA")),
+    @("ntfs.vhd", @("-f", "ntfs", "-s", "128M", "--vhd")),
+    @("ntfsdyn.vhd", @("-f", "ntfs", "-s", "1G", "--vhd-dynamic")),
+    @("cd.iso", @("-L", "TESTCD"))
+)
+$pass = 0; $fail = 0
+foreach ($f in $formats) {
+    $name = $f[0]; $opts = $f[1]
+    $img = "$T\$name"
+    Write-Host "== $name ($($opts -join ' '))"
+    py -m diskimg create $img @opts --from "$T\src" 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Host "  ok   create"; $pass++ } else { Write-Host "  FAIL create"; $fail++ }
+    Remove-Item "$T\out_$name" -Recurse -Force -ErrorAction SilentlyContinue
+    py -m diskimg extract $img / "$T\out_$name" 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Host "  ok   extract"; $pass++ } else { Write-Host "  FAIL extract"; $fail++ }
+    py -m diskimg add $img "$T\r.txt" /a.txt 2>&1 | Out-Null
+    $cat = py -m diskimg cat $img /A.TXT 2>&1
+    if ($cat -match "replaced") { Write-Host "  ok   replace"; $pass++ } else { Write-Host "  FAIL replace"; $fail++ }
+    py -m diskimg mkdir $img /new/dir 2>&1 | Out-Null
+    py -m diskimg add $img "$T\huge.bin" /new/dir/ 2>&1 | Out-Null
+    py -m diskimg cat $img /new/dir/huge.bin 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Host "  ok   add big"; $pass++ } else { Write-Host "  FAIL add big"; $fail++ }
+    py -m diskimg rm $img /sub -r 2>&1 | Out-Null
+    py -m diskimg ls $img /sub 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Host "  ok   rm -r"; $pass++ } else { Write-Host "  FAIL rm -r"; $fail++ }
+    py -m diskimg rm $img /empty.dat 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) { Write-Host "  ok   rm file"; $pass++ } else { Write-Host "  FAIL rm file"; $fail++ }
+}
+Write-Host ""
+Write-Host "Итого: пройдено $pass, ошибок $fail"

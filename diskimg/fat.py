@@ -393,16 +393,14 @@ class Fat(FileSystem):
         if pe is None or not (pe["attr"] & ATTR_DIR): return err("нет каталога %s", parent_path)
         pclus = pe["clus"]
         chain, buf = self._dir_load(pclus)
+        
         old = self._find(buf, name)
         if old is not None:
             if old["attr"] & ATTR_DIR: return err("%s — каталог", path)
             self._free_chain(old["clus"])
-            for i in range(old["sfn_slot"]*32 - 32*20, old["sfn_slot"]*32 + 32, 32):
-                if 0 <= i < len(buf) and buf[i] == 0xE5 or (buf[i+11] & 0x3F) == ATTR_LFN:
-                    buf[i:i+32] = b"\xE5" * 1 + buf[i+1:i+32]
-            # надёжнее: удалить все LFN + SFN этого файла
             _del_entry(buf, old)
             name = old["name"]  # сохранить исходное написание
+        
         src.seek(0); data = src.read()
         nclus = DIV_UP(len(data), self.csize)
         cl = self._alloc_clusters(nclus) if nclus else []

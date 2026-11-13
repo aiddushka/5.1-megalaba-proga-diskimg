@@ -6,6 +6,8 @@ from .bdev import (bdev_open_file, mbr_read, part_type_name, Window,
 from .fs import FileSystem
 
 def _fatal(msg, code=1):
+    import traceback
+    traceback.print_exc()
     print(f"diskimg: {msg}", file=sys.stderr); return code
 
 def image_open(path, writable=False):
@@ -26,15 +28,18 @@ def image_open(path, writable=False):
     raise RuntimeError("нет раздела с поддерживаемой ФС")
 
 def mount_fs(base, part, fstype):
+    v = Window(base, part["lba"]*512, part["count"]*512) if part else base
     if fstype == "ISO":
         from .iso import Iso
         return Iso(base)
+    if fstype == "NTFS":
+        from .ntfs import Ntfs
+        return Ntfs(v)
+    if fstype == "FAT":
+        from .fat import Fat
+        return Fat(v)
+    raise RuntimeError(f"{fstype}: не поддерживается")
 
-    if fstype != "FAT":
-        raise RuntimeError(f"{fstype}: сейчас реализован только FAT")
-    from .fat import Fat
-    v = Window(base, part["lba"]*512, part["count"]*512) if part else base
-    return Fat(v)
 
 def _fmt(e):
     if e.is_dir: return f"  <DIR>         {e.name}/"
@@ -122,18 +127,47 @@ def parse_size(s):
 def cmd_create(a):
     ext = a.image.lower().rsplit(".", 1)[-1] if "." in a.image else ""
     fstype = a.fstype
-    if not fstype and ext == "iso": fstype = "iso"          # ← автоопределение по .iso
+    if not fstype and ext == "iso": fstype = "iso"
     if fstype == "iso":
         from .iso import iso_create
         label = a.label or "CDROM"
         rc = iso_create(a.image, label, a.from_dir)
         if rc == 0:
             print(f"Создан образ {a.image}: ISO9660+Joliet, метка {label}")
-        return rc    
+        return rc
 
     floppy = (a.typ == "floppy") or ext in ("ima", "flp")
     cont = "vhd-dynamic" if a.vhd_dynamic else "vhd" if (a.vhd or ext == "vhd") else "raw"
-    bits = {"fat12":12, "fat16":16, "fat32":32}.get(a.fstype or "", 0)
+    size = parse_size(a.size) or (1474560 if floppy else 64*1024*1024)   # ← size ДО bits
+    if fstype == "ntfs":
+        from .ntfs import ntfs_format
+        if cont == "raw": raw_create(a.image, size)
+        elif cont == "vhd": vhd_create(a.image, size, False)
+        else: vhd_create(a.image, size, True)
+        base = bdev_open_file(a.image, True)
+        align = a.align
+        if not a.no_mbr and not floppy:
+            total = base.size // 512
+            if align < 1 or align >= total // 2: align = 2048
+            count = total - align
+            vol = Window(base, align*512, count*512)
+        else:
+            vol = base; align = 0
+        opts = {"label": a.label or "", "cluster_size": parse_size(a.cluster),
+                "hidden_sectors": align, "floppy": floppy}
+        rc = ntfs_format(vol, opts)
+        if rc == 0 and not a.no_mbr and not floppy:
+            total = base.size // 512
+            count = total - align
+            mbr_write_single(base, align, count, 0x07)
+        base.flush(); base.close()
+        if rc == 0:
+            print(f"Создан образ {a.image}: {cont}, {size} байт, NTFS"
+                  + (", MBR + 1 раздел" if (not a.no_mbr and not floppy) else ", без MBR"))
+            if a.from_dir:
+                return _add_from_dir(a.image, a.from_dir)
+        return rc
+    bits = {"fat12":12, "fat16":16, "fat32":32}.get(fstype or "", 0)
     if not bits:
         bits = 12 if (floppy or size <= 4*1024*1024) else 16 if size <= 512*1024*1024 else 32
     # создать контейнер
@@ -163,8 +197,10 @@ def cmd_create(a):
     print(f"Создан образ {a.image}: {cont}, {size} байт, FAT{bits}"
           + (", MBR + 1 раздел" if (not a.no_mbr and not floppy) else ", без MBR"))
     if a.from_dir:
-        return cmd_add(a.image, [a.from_dir], "/")
+        # --from: добавить содержимое каталога в корень (а не /src/)
+        return _add_from_dir(a.image, a.from_dir)
     return 0
+
 
 def cmd_add(image, locals_, dest="/"):
     base, part, fstype = image_open(image, writable=True)
@@ -205,7 +241,11 @@ def cmd_add(image, locals_, dest="/"):
         target = dest
         dest_stat = fs.stat(dest) if dest else None
         if dest.endswith("/") or (dest_stat and dest_stat.is_dir):
-            target = (dest.rstrip("/") + "/" + os.path.basename(local.rstrip("/\\")))
+            # добавляем ВНУТРЬ dest; если dest == "/", basename не нужен
+            if dest.strip("/") == "":
+                target = "/" + os.path.basename(local.rstrip("/\\"))
+            else:
+                target = (dest.rstrip("/") + "/" + os.path.basename(local.rstrip("/\\")))
         walk(local, target)
     fs.flush(); base.flush()
     print(f"Добавлено/заменено файлов: {count}")
@@ -239,7 +279,32 @@ def cmd_mkdir(image, path):
     fs.flush(); base.flush()
     if rc: return 1
     return 0
-
+def _add_from_dir(image, src_dir):
+    """Добавить содержимое каталога в корень образа (--from)."""
+    base, part, fstype = image_open(image, writable=True)
+    fs = mount_fs(base, part, fstype)
+    count = 0
+    def walk(lp, ip):
+        nonlocal count
+        st = os.stat(lp)
+        if os.path.isdir(lp):
+            fs.mkdir(ip)
+            for n in sorted(os.listdir(lp)):
+                walk(os.path.join(lp, n), ip.rstrip("/") + "/" + n)
+        else:
+            class _S: pass
+            s = _S()
+            with open(lp, "rb") as f:
+                s.seek = f.seek; s.read = f.read
+                s.size = st.st_size; s.mtime = int(st.st_mtime)
+                fs.write(ip, s)
+            count += 1
+    # содержимое src_dir -> корень /
+    for n in sorted(os.listdir(src_dir)):
+        walk(os.path.join(src_dir, n), "/" + n)
+    fs.flush(); base.flush()
+    print(f"Добавлено/заменено файлов: {count}")
+    return 0
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="diskimg")
     ap.add_argument("-v", action="store_true")

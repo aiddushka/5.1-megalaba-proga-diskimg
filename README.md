@@ -18,3 +18,6 @@ diskimg-py/
 │   └── run_tests.sh         # тот же, DISKIMG="python -m diskimg"
 ├── examples/                # твои образы для сверки
 └── README-py.md
+
+#Запуск тестов
+Скопировать текст в папке tests и всатвить в PS
