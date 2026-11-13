@@ -10,6 +10,8 @@ def _fatal(msg, code=1):
 
 def image_open(path, writable=False):
     base = bdev_open_file(path, writable)
+    from .iso import iso_probe
+    if iso_probe(base): return base, None, "ISO"
     sec0 = base.read(0, 512)
     if sec0[3:11] == b"NTFS    ": return base, None, "NTFS"
     if sec0[0] in (0xEB, 0xE9):  return base, None, "FAT"
@@ -24,6 +26,10 @@ def image_open(path, writable=False):
     raise RuntimeError("нет раздела с поддерживаемой ФС")
 
 def mount_fs(base, part, fstype):
+    if fstype == "ISO":
+        from .iso import Iso
+        return Iso(base)
+
     if fstype != "FAT":
         raise RuntimeError(f"{fstype}: сейчас реализован только FAT")
     from .fat import Fat
@@ -52,6 +58,7 @@ def cmd_ls(img, path, recursive):
     base, part, fstype = image_open(img)
     fs = mount_fs(base, part, fstype)
     def walk(p, prefix):
+        
         ents = []
         rc = fs.list(p, ents.append)
         if rc: return rc
@@ -114,8 +121,16 @@ def parse_size(s):
 
 def cmd_create(a):
     ext = a.image.lower().rsplit(".", 1)[-1] if "." in a.image else ""
-    if a.fstype == "iso": return _fatal("ISO create — следующая итерация")
-    size = parse_size(a.size) or (1474560 if a.typ == "floppy" else 64*1024*1024)
+    fstype = a.fstype
+    if not fstype and ext == "iso": fstype = "iso"          # ← автоопределение по .iso
+    if fstype == "iso":
+        from .iso import iso_create
+        label = a.label or "CDROM"
+        rc = iso_create(a.image, label, a.from_dir)
+        if rc == 0:
+            print(f"Создан образ {a.image}: ISO9660+Joliet, метка {label}")
+        return rc    
+
     floppy = (a.typ == "floppy") or ext in ("ima", "flp")
     cont = "vhd-dynamic" if a.vhd_dynamic else "vhd" if (a.vhd or ext == "vhd") else "raw"
     bits = {"fat12":12, "fat16":16, "fat32":32}.get(a.fstype or "", 0)
@@ -154,19 +169,35 @@ def cmd_create(a):
 def cmd_add(image, locals_, dest="/"):
     base, part, fstype = image_open(image, writable=True)
     fs = mount_fs(base, part, fstype)
+    # если последний "local" не существует на хосте и начинается с "/" — это dest
+    if len(locals_) > 1 and locals_[-1].startswith("/") and not os.path.isfile(locals_[-1]):
+        dest = locals_[-1]
+        locals_ = locals_[:-1]
     count = 0
+
     def walk(lp, ip):
         nonlocal count
-        st = os.stat(lp)
+        try:
+            st = os.stat(lp)
+        except (FileNotFoundError, PermissionError):
+            print(f"diskimg: пропущен {lp}", file=sys.stderr); return
         if os.path.isdir(lp):
-            fs.mkdir(ip)
-            for n in sorted(os.listdir(lp)):
+            try:
+                fs.mkdir(ip)
+            except Exception:
+                pass
+            try:
+                names = sorted(os.listdir(lp))
+            except PermissionError:
+                print(f"diskimg: нет доступа к {lp}", file=sys.stderr); return
+            for n in names:
                 walk(os.path.join(lp, n), ip.rstrip("/") + "/" + n)
         else:
             class _S: pass
             s = _S()
             with open(lp, "rb") as f:
-                s.seek = f.seek; s.read = f.read; s.mtime = int(st.st_mtime)
+                s.seek = f.seek; s.read = f.read
+                s.size = st.st_size; s.mtime = int(st.st_mtime)
                 fs.write(ip, s)
             count += 1
     for local in locals_:
